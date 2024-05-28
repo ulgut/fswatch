@@ -10,7 +10,7 @@ import (
 // todo: introduce a timeout
 
 const (
-	eventQueueSize = 1
+	eventChanSize = 10
 	runningStatus  = 0x0
 	exitedStatus   = 0x1
 )
@@ -42,21 +42,21 @@ func (w *Watcher) Watch(path string, fn Callback) (err error) {
 	defer w.mut.Unlock()
 
 	if w.stat != runningStatus {
-		return fmt.Errorf("watcher is not available")
+		return fmt.Errorf("[fswatch] - watcher is not available")
 	}
 
 	if _, ok := w.paths[path]; ok {
-		return fmt.Errorf("already watching: '%s'", path)
+		return fmt.Errorf("[fswatch] - already watching: '%s'", path)
 	}
 
 	fd, err := syscall.Open(path, syscall.O_RDONLY, 0) // todo: move lock acq outside of syscall path
 	if err != nil {
-		return fmt.Errorf("failed to open '%s': %v", path, err)
+		return fmt.Errorf("[fswatch] - failed to open '%s': %v", path, err)
 	}
 
 	kq, err := syscall.Kqueue() // todo: handwrap a single kqueue
 	if err != nil {
-		return fmt.Errorf("failed to acquire a kq fd for '%s': %v", path, err)
+		return fmt.Errorf("[fswatch] - failed to acquire a kq fd for '%s': %v", path, err)
 	}
 
 	ctx, cancel := context.WithCancel(w.ctx)
@@ -65,13 +65,14 @@ func (w *Watcher) Watch(path string, fn Callback) (err error) {
 		kq:       kq,
 		ctx:      ctx,
 		cancel:   cancel,
-		shutdown: make(chan struct{}, 1),
-		events:   make(chan Event, eventQueueSize),
+		wg:       sync.WaitGroup{},
+		events:   make(chan Event, eventChanSize),
 		callback: fn,
 	}
 
 	w.paths[path] = entry
 
+	entry.wg.Add(2)
 	go entry.eventProducer(path)
 	go entry.eventConsumer(path)
 
@@ -87,26 +88,28 @@ func (w *Watcher) Remove(path string) error {
 
 	entry, ok := w.paths[path]
 	if !ok {
-		return fmt.Errorf("not watching path: '%s'", path)
+		return fmt.Errorf("[fswatch] - not watching path: '%s'", path)
 	}
-	delete(w.paths, path)
 
-	entry.cancel()
-	<-entry.shutdown
-
+	w.removeEntry(entry, path)
 	return nil
+}
+
+func (w *Watcher) removeEntry(e *entry, path string) {
+	e.cancel()
+	e.wg.Wait()
+
+	close(e.events)
+	delete(w.paths, path)
 }
 
 func (w *Watcher) handleShutdown() {
 	w.mut.Lock()
 	defer w.mut.Unlock()
 
-	fmt.Println("here1")
 
-	for _, entry := range w.paths {
-		entry.cancel()
-		fmt.Println("here2")
-		<-entry.shutdown
+	for path, entry := range w.paths {
+		w.removeEntry(entry, path)
 	}
 
 	w.stat = exitedStatus

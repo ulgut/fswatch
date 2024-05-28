@@ -3,21 +3,25 @@ package fswatch
 import (
 	"context"
 	"fmt"
+	"sync"
 	"syscall"
 )
 
 const (
+	kQueueSize      = 1
 	queueWatchMode  = syscall.EVFILT_VNODE
 	queueFlagBitmap = syscall.EV_ADD | syscall.EV_ENABLE | syscall.EV_ONESHOT
 	watchFlagBitmap = syscall.NOTE_DELETE | syscall.NOTE_WRITE | syscall.NOTE_EXTEND | syscall.NOTE_RENAME
 )
 
+var timeout = syscall.Timespec{Sec: 0, Nsec: 0} // quick poll
+
 type Callback func(Event)
 
 type entry struct {
-	ctx      context.Context
-	cancel   context.CancelFunc
-	shutdown chan struct{}
+	ctx    context.Context
+	cancel context.CancelFunc
+	wg     sync.WaitGroup
 
 	fd int // path fd
 	kq int // kqueue fd
@@ -27,25 +31,27 @@ type entry struct {
 }
 
 func (e *entry) eventConsumer(path string) {
-	fmt.Printf("monitoring: '%s'\n", path)
+	defer e.wg.Done()
+
+	fmt.Printf("[fswatch] - monitoring: '%s'\n", path)
 
 	for {
 		select {
 		case <-e.ctx.Done():
-			fmt.Printf("shutting consumer wrkr for path: '%s'\n", path)
+			fmt.Printf("[fswatch] - shutting consumer wrkr for path: '%s'\n", path)
 			return
 		case event := <-e.events: // todo: update this
-			e.callback(event)
+			e.callback(event) // todo: need to execute this separately
 		}
 	}
 }
 
 func (e *entry) eventProducer(path string) {
+	defer e.wg.Done()
 	defer syscall.Close(e.fd)
 	defer syscall.Close(e.kq)
-	defer close(e.shutdown)
 
-	events := make([]syscall.Kevent_t, eventQueueSize)
+	events := make([]syscall.Kevent_t, kQueueSize)
 	config := []syscall.Kevent_t{{
 		Ident:  uint64(e.fd),
 		Filter: queueWatchMode,
@@ -56,20 +62,20 @@ func (e *entry) eventProducer(path string) {
 	}}
 
 	for {
+		n, err := syscall.Kevent(e.kq, config, events, &timeout)
+
 		select {
 		case <-e.ctx.Done():
-			fmt.Printf("shutting producer wrkr for path: '%s'\n", path)
+			fmt.Printf("[fswatch] - shutting producer wrkr for path: '%s'\n", path)
 			return
 		default:
-			n, err := syscall.Kevent(e.kq, config, events, nil)
 			if err != nil { // todo: make more robust
 				continue
 			}
 			for i := 0; i < n; i++ {
 				if events[i].Flags&syscall.EV_ERROR != 0 {
-					panic(fmt.Sprintf("error: %v", syscall.Errno(events[i].Data)))
+					panic(fmt.Sprintf("[fswatch] - error: %v", syscall.Errno(events[i].Data)))
 				}
-				fmt.Println("reokrpofkerofk?")
 				e.events <- buildEvent(&events[i], path)
 			}
 		}
